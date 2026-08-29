@@ -20,3 +20,4 @@ if st.button("Calculate EV"):
         st.success("Recommendation: Take the **LESS (Under)** 🔒")
     else:
         st.info("Recommendation: Take the **MORE (Over)**")
+player_name = st.st.text_input("Player Name", "Enter Pitcher Name")
