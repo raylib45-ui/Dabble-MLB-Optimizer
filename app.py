@@ -1,7 +1,4 @@
-
-
-rick_sanchez_mlb_k_hammer.py
-
+rick_sanchez_mlb_k_hammer
 #!/usr/bin/env python3
 
 """
