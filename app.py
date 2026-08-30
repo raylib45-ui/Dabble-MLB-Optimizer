@@ -44,4 +44,4 @@ if st.button("Calculate EV Now", key="unique_calculate_ev_button"):
             st.error("Enter valid logs.")
     except Exception as e:
         st.error(f"Error: {e}")
-
+https://snappy-api-tjfdt5qepa-uc.a.run.app/c/x0tAQkpKczGNXpmH
