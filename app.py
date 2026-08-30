@@ -21,8 +21,6 @@ if st.button("Calculate EV"):
     else:
         st.info("Recommendation: Take the **MORE (Over)**")
 player_name = st.text_input("Player Name", "Enter Pitcher Name")
-import streamlit as st
-
 st.set_page_config(page_title="Dabble MLB Strikeout Optimizer", page_icon="⚾", layout="centered")
 
 st.title("⚾ Dabble MLB Strikeout Optimizer")
@@ -83,3 +81,5 @@ if st.button("Calculate Recalibrated EV"):
             
     except Exception as e:
         st.error(f"Error processing input: {e}")
+
+
