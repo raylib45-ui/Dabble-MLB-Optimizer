@@ -63,3 +63,24 @@ with col2:
     st.markdown("**LINE SET HIGH - ABOVE HISTORY**")
     st.markdown("Line 7.5 is above L5 avg 6.7 and L10 avg 6.2 - only 20% of last 10 cleared this line.")
     st.markdown("Opponents K% required to hit Over is high, 8-pitcher lineup improves chances - genuine OVER opportunity if metrics hold.")
+import pandas as pd
+
+# Dabble MLB Strikeout Projections Engine
+def calculate_ev(line, projection, odds_multiplier):
+    diff = projection - line
+    prob_over = 0.5 + (diff * 0.1)  # heuristic probability adjustment
+    prob_over = max(0.1, min(0.9, prob_over))
+    prob_under = 1 - prob_over
+    
+    ev_over = (prob_over * odds_multiplier) - 1
+    return {
+        "prob_over": round(prob_over, 3), 
+        "prob_under": round(prob_under, 3),
+        "ev_over": round(ev_over, 3)
+    }
+
+if __name__ == "__main__":
+    print("Running Dabble MLB Strikeout Optimizer...")
+    # Example: Cristopher Sánchez 7.5 K's line test
+    result = calculate_ev(line=7.5, projection=6.8, odds_multiplier=1.1)
+    print("Analysis Result:", result)
