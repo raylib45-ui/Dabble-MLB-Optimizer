@@ -174,5 +174,3 @@ def shrink_rate(
     sample_size: float,
     prior_rate: float,
     prior_sample: float,
-) -> float:
-    if sample_size <= 0:
