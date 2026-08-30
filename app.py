@@ -1,4 +1,4 @@
-copy/paste this into a file named:
+
 
 rick_sanchez_mlb_k_hammer.py
 
