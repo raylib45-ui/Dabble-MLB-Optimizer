@@ -80,9 +80,13 @@ class ATSWinsStrikeoutEngine:
         fair_over_odds = self._probability_to_american_odds(prob_over)
         fair_under_odds = self._probability_to_american_odds(prob_under)
         
-        # Strict Threshold Rule (>56% probability required for locks)
-        if prob_over >= 0.56:
+        # Enhanced Edge Threshold Logic including Hammer Signals
+        if prob_over >= 0.62:
+            rec = "🔨 HAMMER MORE (Over)"
+        elif prob_over >= 0.56:
             rec = "🔒 MORE (Over)"
+        elif prob_under >= 0.62:
+            rec = "🔨 HAMMER LESS (Under)"
         elif prob_under >= 0.56:
             rec = "🔒 LESS (Under)"
         else:
@@ -117,7 +121,7 @@ class ATSWinsStrikeoutEngine:
 st.set_page_config(page_title="ATSwins MLB Strikeout Model", layout="wide")
 
 st.title("🎯 ATSwins MLB Strikeout Projection Dashboard")
-st.markdown("Simulating pitcher outcome distributions and automatically evaluating **More / Less / Pass** signals.")
+st.markdown("Simulating pitcher outcome distributions with **Hammer More / Hammer Less** high-edge confidence filters.")
 
 engine = ATSWinsStrikeoutEngine()
 
@@ -186,7 +190,7 @@ dist_df = pd.DataFrame(list(sim_result.probability_distribution.items()), column
 st.bar_chart(dist_df.set_index("Strikeouts"))
 
 st.markdown("---")
-st.subheader("📋 Full Slate Automatic Signals & Recommendations")
+st.subheader("📋 Full Slate Automatic Signals & Hammer Edges")
 
 results_list = []
 for item in slate_data:
