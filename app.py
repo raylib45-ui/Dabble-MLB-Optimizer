@@ -1,176 +1,189 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import Dict
+import streamlit as st
+
+# ==========================================
+# 1. CORE DATA STRUCTURES & CONFIGURATION
+# ==========================================
 
 @dataclass
-class Hitter:
+class PitcherProfile:
     name: str
-    bats: str
-    k_pct_vs_rhp: float
-    k_pct_vs_lhp: float
-    high_k_flag: bool = False
-    def k_vs(self, pitcher_throws: str) -> float:
-        return self.k_pct_vs_rhp if pitcher_throws == "R" else self.k_pct_vs_lhp
+    base_k_pct: float          # Strikeout rate per batter faced (K%)
+    sw_str_pct: float          # Swinging-strike rate
+    called_str_pct: float      # Called strike percentage
+    projected_innings: float   # Expected workload
 
 @dataclass
-class Pitcher:
-    name: str
-    throws: str
-    k_pct: float
-    swinging_strike_pct: float
-    called_strike_plus_whiff: float
-    putaway_pct: float
-    velo_mph: float
-    arsenal_k_vs_rhb: float
-    arsenal_whiff_vs_rhb: float
-    arsenal_k_vs_lhb: float = 0.20
-    arsenal_whiff_vs_lhb: float = 0.26
-    avg_ip: float = 5.8
-    avg_pitch_count: float = 92
-    ip_std: float = 0.9
-    pitches_per_pa: float = 4.1
-    consistency_grade: str = "B" # A+ = narrow, C = wide
-    last10_k_avg: float = 6.0
-    l10_line_avg: float = 6.0
+class LineupContext:
+    team_name: str
+    k_pct_vs_handedness: float # Opponent team K% vs pitcher hand
+    lineup_missing_power: bool # Late scratch or missing high-K hitters
+    weather_wind_outward: bool # Environmental factor affecting pitcher/hitter approach
 
 @dataclass
-class GameContext:
-    park_factor_k: float = 1.0
-    wind_mph: float = 0
-    wind_direction: str = "neutral"
-    ump_k_boost: float = 0.0
-    offense_strength: float = 1.0
-    game_importance: float = 1.0
-    bullpen_fatigue: float = 1.0
+class SimulationResult:
+    expected_value: float
+    probability_distribution: Dict[str, float]
+    prob_over_line: float
+    implied_fair_odds: str
 
-class MLBPitcherKModel:
-    def __init__(self, batters_per_inning: float = 4.32):
-        self.bpi = batters_per_inning
 
-    def pitcher_true_talent(self, p: Pitcher, vs: str) -> float:
-        base = p.k_pct * 0.50
-        sw = p.swinging_strike_pct * 2.0 * 0.20
-        putaway = p.putaway_pct * 0.30
-        arsenal = (p.arsenal_k_vs_rhb if vs == "RHB" else p.arsenal_k_vs_lhb) * 0.20
-        velo_adj = (p.velo_mph - 93.0) * 0.008
-        talent = base + sw + putaway + arsenal + velo_adj
-        blended = talent * 0.7 + (p.last10_k_avg / (p.avg_ip * self.bpi)) * 0.3
-        return np.clip(blended, 0.12, 0.38)
+# ==========================================
+# 2. THE ATSWINS STRIKEBAIT PROJECTION ENGINE
+# ==========================================
 
-    def opponent_factor(self, pitcher: Pitcher, lineup: List[Hitter]):
-        k_list = [h.k_vs(pitcher.throws) for h in lineup]
-        avg_k = np.mean(k_list)
-        high_k_count = sum(1 for h in lineup if h.high_k_flag)
-        high_k_adjust = (high_k_count - 3.5) * 0.015
-        breakdown = [{"batter": h.name, "k%": h.k_vs(pitcher.throws)} for h in lineup]
-        return avg_k + high_k_adjust, high_k_count, breakdown
+class ATSWinsStrikeoutEngine:
+    def __init__(self, simulations: int = 5000):
+        self.simulations = simulations
 
-    def expected_workload(self, p: Pitcher, ctx: GameContext, n_sims: int = 10000):
-        exp_ip = p.avg_ip * ctx.bullpen_fatigue * ctx.game_importance
-        grade_to_std = {"A+": 0.4, "A": 0.6, "B+": 0.8, "B": 0.9, "C": 1.3, "D": 1.6}
-        std = grade_to_std.get(p.consistency_grade, p.ip_std)
-        a, b = (0 - exp_ip) / std, (9 - exp_ip) / std
-        ip_dist = truncnorm.rvs(a, b, loc=exp_ip, scale=std, size=n_sims)
-        early_exit_mask = np.random.rand(n_sims) < 0.05
-        ip_dist[early_exit_mask] *= np.random.uniform(0.4, 0.75, size=early_exit_mask.sum())
-        return ip_dist
+    def compute_core_ability(self, pitcher: PitcherProfile, lineup: LineupContext) -> float:
+        skill_score = (pitcher.base_k_pct * 0.5) + (pitcher.sw_str_pct * 0.3) + (pitcher.called_str_pct * 0.2)
+        opponent_adjustment = lineup.k_pct_vs_handedness - 0.220
+        lineup_penalty = -0.02 if lineup.lineup_missing_power else 0.0
+        weather_adjustment = -0.01 if lineup.weather_wind_outward else 0.0
+        
+        adjusted_k_rate = skill_score + opponent_adjustment + lineup_penalty + weather_adjustment
+        return max(0.10, min(0.45, adjusted_k_rate))
 
-    def context_multiplier(self, ctx: GameContext) -> float:
-        mult = 1.0 * ctx.park_factor_k * ctx.offense_strength
-        if ctx.wind_direction == "in" and ctx.wind_mph > 8: mult *= 1.03
-        elif ctx.wind_direction == "out" and ctx.wind_mph > 10: mult *= 0.97
-        mult += ctx.ump_k_boost
-        return np.clip(mult, 0.85, 1.15)
+    def run_simulation(self, pitcher: PitcherProfile, adjusted_k_rate: float) -> np.ndarray:
+        expected_batters_faced = pitcher.projected_innings * 4.2
+        simulated_batters = np.random.normal(loc=expected_batters_faced, scale=1.5, size=self.simulations)
+        simulated_batters = np.clip(simulated_batters, 12, 35)
+        strikeouts = np.random.binomial(n=simulated_batters.astype(int), p=adjusted_k_rate)
+        return strikeouts
 
-    def project(self, pitcher: Pitcher, lineup: List[Hitter], ctx: GameContext, n_sims: int = 10000):
-        true_talent = self.pitcher_true_talent(pitcher, "RHB")
-        opp_k_avg, high_k_count, breakdown = self.opponent_factor(pitcher, lineup)
-        adj_k_per_pa = true_talent * (opp_k_avg / 0.22) * self.context_multiplier(ctx)
-        adj_k_per_pa = np.clip(adj_k_per_pa, 0.10, 0.45)
-
-        ip_sims = self.expected_workload(pitcher, ctx, n_sims=n_sims)
-        bf_sims = ip_sims * self.bpi * np.random.normal(1.0, 0.07, n_sims)
-        bf_sims = np.clip(bf_sims, 12, 36)
-
-        grade_to_conc = {"A+": 180, "A": 120, "B+": 80, "B": 60, "C": 30, "D": 15}
-        conc = grade_to_conc.get(pitcher.consistency_grade, 60)
-        alpha = adj_k_per_pa * conc
-        beta_param = (1 - adj_k_per_pa) * conc
-
-        k_sims = []
-        for bf in bf_sims:
-            bf_int = int(round(bf))
-            p_sample = beta.rvs(alpha, beta_param, size=bf_int)
-            k_sims.append(np.random.binomial(1, p_sample).sum())
-        k_sims = np.array(k_sims)
-
-        dist = {i: (k_sims == i).mean() for i in range(0, 16)}
-        return {
-            "pitcher": pitcher.name,
-            "proj_k_mean": round(k_sims.mean(), 2),
-            "exact_model": round(k_sims.mean() + np.random.normal(0, 0.05), 3),
-            "adj_k_per_pa": round(adj_k_per_pa, 4),
-            "opp_k_avg": round(opp_k_avg, 4),
-            "high_k_hitters": high_k_count,
-            "exp_ip_mean": round(ip_sims.mean(), 2),
-            "exp_bf_mean": round(bf_sims.mean(), 1),
-            "k_sims": k_sims,
-            "distribution": dist,
-            "breakdown": breakdown
+    def evaluate_prop(self, pitcher: PitcherProfile, lineup: LineupContext, market_line: float) -> SimulationResult:
+        adjusted_k_rate = self.compute_core_ability(pitcher, lineup)
+        strikeout_samples = self.run_simulation(pitcher, adjusted_k_rate)
+        
+        ev = float(np.mean(strikeout_samples))
+        n_total = float(len(strikeout_samples))
+        
+        distribution = {
+            "4 or fewer": round(np.sum(strikeout_samples <= 4) / n_total * 100, 1),
+            "5": round(np.sum(strikeout_samples == 5) / n_total * 100, 1),
+            "6": round(np.sum(strikeout_samples == 6) / n_total * 100, 1),
+            "7": round(np.sum(strikeout_samples == 7) / n_total * 100, 1),
+            "8+": round(np.sum(strikeout_samples >= 8) / n_total * 100, 1)
         }
+        
+        line_threshold = int(np.floor(market_line)) + 1
+        prob_over = np.sum(strikeout_samples >= line_threshold) / n_total
+        fair_odds = self._probability_to_american_odds(prob_over)
+        
+        return SimulationResult(
+            expected_value=round(ev, 2),
+            probability_distribution=distribution,
+            prob_over_line=round(prob_over * 100, 1),
+            implied_fair_odds=fair_odds
+        )
 
     @staticmethod
-    def prob_over(k_sims, line): return (k_sims > line).mean()
-    @staticmethod
-    def american_odds(prob):
-        if prob <= 0.01: return 9900
-        if prob >= 0.99: return -9900
-        return int(-(prob*100)/(1-prob)) if prob>=0.5 else int((1-prob)*100/prob)
+    def _probability_to_american_odds(prob: float) -> str:
+        if prob <= 0 or prob >= 1:
+            return "N/A"
+        if prob > 0.5:
+            odds = -int((prob / (1 - prob)) * 100)
+            return str(odds)
+        else:
+            odds = int(((1 - prob) / prob) * 100)
+            return f"+{odds}"
 
-    def evaluate_prop(self, proj_result, market_line, market_over_price=-110, market_under_price=-110):
-        k_sims = proj_result["k_sims"]
-        p_over = self.prob_over(k_sims, market_line)
-        p_under = 1 - p_over
-        fair_over = self.american_odds(p_over)
-        fair_under = self.american_odds(p_under)
 
-        def to_imp(o): return abs(o)/(abs(o)+100) if o<0 else 100/(o+100)
-        m_over, m_under = to_imp(market_over_price), to_imp(market_under_price)
-        total = m_over + m_under
-        edge_over = p_over - (m_over/total)
-        edge_under = p_under - (m_under/total)
+# ==========================================
+# 3. STREAMLIT UI DASHBOARD
+# ==========================================
 
-        lean = "NO EDGE"
-        if edge_over > 0.06: lean = f"OVER {market_line} - Strong Signal"
-        elif edge_under > 0.06: lean = f"UNDER {market_line} - Strong Signal"
-        elif edge_over > 0.03: lean = f"Lean OVER {market_line}"
-        elif edge_under > 0.03: lean = f"Lean UNDER {market_line}"
+st.set_page_config(page_title="ATSwins MLB Strikeout Model", layout="wide")
 
-        return {
-            "line": market_line,
-            "model_mean": proj_result["proj_k_mean"],
-            "p_over": round(p_over,4),
-            "fair_over": fair_over,
-            "edge_over": round(edge_over,4),
-            "edge_under": round(edge_under,4),
-            "lean": lean,
-            "std": round(k_sims.std(),2),
-            "dist": proj_result["distribution"]
-        }
+st.title("🎯 ATSwins MLB Strikeout Projection Dashboard")
+st.markdown("Simulating pitcher outcome distributions and evaluating prop lines from the Dabble slate.")
 
-# Example - matches your last screenshot (5.4 proj vs Twins lineup)
-if __name__ == "__main__":
-    pitcher = Pitcher("Seymour-type", "R", 0.24, 0.115, 0.29, 0.24, 94.2, 0.207, 0.26, consistency_grade="B", avg_ip=5.3, last10_k_avg=5.1)
-    lineup = [
-        Hitter("Bell", "R", 0.21, 0.214, False), Hitter("Lee", "R", 0.144, 0.13, False),
-        Hitter("Keaschall", "R", 0.147, 0.142, False), Hitter("Clemens", "L", 0.226, 0.225, False),
-        Hitter("Lewis", "R", 0.206, 0.265, True), Hitter("Buxton", "R", 0.251, 0.242, True),
-        Hitter("Larnach", "L", 0.17, 0.168, False), Hitter("Caratini", "R", 0.173, 0.156, False),
-        Hitter("Jeffers", "R", 0.169, 0.189, False),
-    ]
-    ctx = GameContext(park_factor_k=1.02, wind_mph=6, wind_direction="in", ump_k_boost=0.01, offense_strength=0.95)
-    model = MLBPitcherKModel()
-    proj = model.project(pitcher, lineup, ctx, 10000)
-    print(proj)
-    print(model.evaluate_prop(proj, 6.5))
+# Initialize Engine
+engine = ATSWinsStrikeoutEngine()
+
+# Slate Data from Dabble Lobby
+slate_data = [
+    {"name": "Ian Seymour (P)", "line": 6.5, "k_pct": 0.28, "sw_str": 0.14, "called": 0.18, "ip": 6.0, "opp_k": 0.24},
+    {"name": "Payton Tolle (P)", "line": 6.5, "k_pct": 0.27, "sw_str": 0.13, "called": 0.17, "ip": 5.8, "opp_k": 0.22},
+    {"name": "Jacob deGrom (P)", "line": 6.5, "k_pct": 0.31, "sw_str": 0.16, "called": 0.19, "ip": 6.2, "opp_k": 0.25},
+    {"name": "Michael King (P)", "line": 5.5, "k_pct": 0.26, "sw_str": 0.12, "called": 0.17, "ip": 5.5, "opp_k": 0.21},
+    {"name": "Kyle Harrison (P)", "line": 5.5, "k_pct": 0.25, "sw_str": 0.13, "called": 0.16, "ip": 5.2, "opp_k": 0.23},
+    {"name": "Taj Bradley (P)", "line": 5.5, "k_pct": 0.27, "sw_str": 0.14, "called": 0.17, "ip": 5.5, "opp_k": 0.24},
+    {"name": "Gage Jump (P)", "line": 5.5, "k_pct": 0.24, "sw_str": 0.11, "called": 0.15, "ip": 5.0, "opp_k": 0.20},
+    {"name": "Peter Lambert (P)", "line": 5.5, "k_pct": 0.21, "sw_str": 0.10, "called": 0.15, "ip": 5.0, "opp_k": 0.19},
+    {"name": "Walbert Urena (P)", "line": 5.5, "k_pct": 0.22, "sw_str": 0.10, "called": 0.16, "ip": 5.0, "opp_k": 0.20},
+    {"name": "Brady Singer (P)", "line": 4.5, "k_pct": 0.22, "sw_str": 0.11, "called": 0.16, "ip": 5.5, "opp_k": 0.21},
+    {"name": "George Kirby (P)", "line": 4.5, "k_pct": 0.23, "sw_str": 0.12, "called": 0.18, "ip": 6.0, "opp_k": 0.20},
+    {"name": "Clay Holmes (P)", "line": 4.5, "k_pct": 0.22, "sw_str": 0.11, "called": 0.15, "ip": 4.8, "opp_k": 0.22},
+    {"name": "Anthony Kay (P)", "line": 4.5, "k_pct": 0.21, "sw_str": 0.10, "called": 0.14, "ip": 4.5, "opp_k": 0.21},
+    {"name": "Tanner Gordon (P)", "line": 4.5, "k_pct": 0.20, "sw_str": 0.09, "called": 0.14, "ip": 4.5, "opp_k": 0.20},
+    {"name": "Elmer Rodriguez-Cruz (P)", "line": 4.5, "k_pct": 0.21, "sw_str": 0.10, "called": 0.15, "ip": 4.5, "opp_k": 0.21},
+    {"name": "Aaron Nola (P)", "line": 4.5, "k_pct": 0.27, "sw_str": 0.13, "called": 0.17, "ip": 6.0, "opp_k": 0.23},
+    {"name": "Robert Stock (P)", "line": 3.5, "k_pct": 0.20, "sw_str": 0.09, "called": 0.14, "ip": 4.2, "opp_k": 0.19},
+    {"name": "Will Dion (P)", "line": 3.5, "k_pct": 0.19, "sw_str": 0.08, "called": 0.13, "ip": 4.0, "opp_k": 0.18},
+    {"name": "Jackson Jobe (P)", "line": 3.5, "k_pct": 0.23, "sw_str": 0.11, "called": 0.15, "ip": 4.5, "opp_k": 0.21}
+]
+
+# Sidebar Controls for Customization
+st.sidebar.header("⚙️ Model Settings")
+selected_pitcher_name = st.sidebar.selectbox("Select Pitcher to Inspect", [p["name"] for p in slate_data])
+
+# Find selected pitcher data
+selected_data = next(p for p in slate_data if p["name"] == selected_pitcher_name)
+
+st.sidebar.subheader("Adjust Parameters")
+custom_line = st.sidebar.number_input("Market Line", value=float(selected_data["line"]), step=0.5)
+custom_ip = st.sidebar.number_input("Projected Innings", value=float(selected_data["ip"]), step=0.1)
+missing_power = st.sidebar.checkbox("Opponent Missing Power Hitter?", value=False)
+wind_outward = st.sidebar.checkbox("Wind Blowing Out?", value=False)
+
+# Run simulation for selected pitcher
+pitcher_obj = PitcherProfile(
+    name=selected_data["name"],
+    base_k_pct=selected_data["k_pct"],
+    sw_str_pct=selected_data["sw_str"],
+    called_str_pct=selected_data["called"],
+    projected_innings=custom_ip
+)
+lineup_obj = LineupContext(
+    team_name="Opponent",
+    k_pct_vs_handedness=selected_data["opp_k"],
+    lineup_missing_power=missing_power,
+    weather_wind_outward=wind_outward
+)
+
+sim_result = engine.evaluate_prop(pitcher_obj, lineup_obj, custom_line)
+
+# Display Key Metrics
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Model Expected Value (EV)", f"{sim_result.expected_value} K's")
+col2.metric("Market Line", f"{custom_line}")
+col3.metric("Over Prob (%)", f"{sim_result.prob_over_line}%")
+col4.metric("Fair Odds (Over)", f"{sim_result.implied_fair_odds}")
+
+st.markdown("---")
+st.subheader(f"📊 Outcome Distribution for {selected_pitcher_name}")
+dist_df = pd.DataFrame(list(sim_result.probability_distribution.items()), columns=["Strikeouts", "Probability (%)"])
+st.bar_chart(dist_df.set_index("Strikeouts"))
+
+st.markdown("---")
+st.subheader("📋 Full Dabble Slate Evaluation Table")
+
+results_list = []
+for item in slate_data:
+    p = PitcherProfile(item["name"], item["k_pct"], item["sw_str"], item["called"], item["ip"])
+    l = LineupContext("Opp", item["opp_k"], False, False)
+    res = engine.evaluate_prop(p, l, item["line"])
+    results_list.append({
+        "Pitcher": item["name"],
+        "Line": item["line"],
+        "Model EV": res.expected_value,
+        "Over Prob (%)": res.prob_over_line,
+        "Fair Odds": res.implied_fair_odds
+    })
+
+st.dataframe(pd.DataFrame(results_list), use_container_width=True)
