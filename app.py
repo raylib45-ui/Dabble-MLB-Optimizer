@@ -4,40 +4,28 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import List
 
-st.set_page_config(page_title="MLB K Model - ATS WINS Logic", layout="wide")
+st.set_page_config(page_title="MLB K Model - Live Statcast", layout="wide")
+
+try:
+    from pybaseball import pitching_stats
+    HAS_PYBASEBALL = True
+except Exception as e:
+    HAS_PYBASEBALL = False
+    PYBASEBALL_ERROR = str(e)
 
 @dataclass
 class Pitcher:
-    name: str
-    team: str
-    opp: str
-    throws: str
-    line: float
-    l5: List[int]
-    k_pct: float
-    swstr: float
-    putaway: float
-    velo: float
-    arsenal_k: float
-    avg_ip: float
-    grade: str
-    less_x: float = 1.0
-    more_x: float = 1.0
+    name: str; team: str; opp: str; throws: str; line: float; l5: List[int]
+    k_pct: float; swstr: float; putaway: float; velo: float; arsenal_k: float
+    avg_ip: float; grade: str; less_x: float = 1.0; more_x: float = 1.0
 
 @dataclass
 class GameContext:
-    park: str
-    park_k: float = 1.0
-    wind_mph: int = 5
-    wind_dir: str = "neutral"
-    ump_boost: float = 0.0
-    opp_strength: float = 1.0
-    pen_fatigue: float = 1.0
+    park: str; park_k: float = 1.0; wind_mph: int = 5; wind_dir: str = "neutral"
+    ump_boost: float = 0.0; opp_strength: float = 1.0; pen_fatigue: float = 1.0
 
 class KModel:
-    def __init__(self):
-        self.bpi = 4.32
-
+    def __init__(self): self.bpi = 4.32
     def true_talent(self, p):
         base = p.k_pct * 0.75
         sw_adj = (p.swstr - 0.11) * 0.6
@@ -46,62 +34,44 @@ class KModel:
         velo_adj = (p.velo - 93.0) * 0.004
         recent = float(np.mean(p.l5)) / (p.avg_ip * self.bpi) if p.avg_ip else 0.22
         talent = base + sw_adj + put_adj + ars_adj + velo_adj
-        blended = talent * 0.80 + recent * 0.20
-        return float(np.clip(blended, 0.14, 0.33))
-
+        return float(np.clip(talent * 0.80 + recent * 0.20, 0.14, 0.33))
     def workload(self, p, ctx, n=10000):
         exp_ip = p.avg_ip * ctx.pen_fatigue
-        std_map = {"A+": 0.4, "A": 0.6, "B+": 0.8, "B": 0.9, "C": 1.3, "D": 1.6}
-        std = std_map.get(p.grade, 0.9)
+        std = {"A+":0.4,"A":0.6,"B+":0.8,"B":0.9,"C":1.3,"D":1.6}.get(p.grade,0.9)
         ip = np.random.normal(exp_ip, std, size=n)
         ip = np.clip(ip, 0.5, 9.0)
         early = np.random.rand(n) < 0.05
         ip[early] = ip[early] * np.random.uniform(0.4, 0.75, size=early.sum())
         return ip
-
     def context_mult(self, ctx):
         m = ctx.park_k * ctx.opp_strength + ctx.ump_boost
-        if ctx.wind_dir == "in" and ctx.wind_mph > 8:
-            m = m * 1.03
-        if ctx.wind_dir == "out" and ctx.wind_mph > 10:
-            m = m * 0.97
+        if ctx.wind_dir == "in" and ctx.wind_mph > 8: m = m * 1.03
+        if ctx.wind_dir == "out" and ctx.wind_mph > 10: m = m * 0.97
         return float(np.clip(m, 0.85, 1.15))
-
     def project(self, p, opp_k_avg, ctx, n=8000):
         adj = self.true_talent(p) * (opp_k_avg / 0.22) * self.context_mult(ctx)
         adj = float(np.clip(adj, 0.10, 0.38))
         ip_sims = self.workload(p, ctx, n)
         bf_sims = ip_sims * self.bpi * np.random.normal(1, 0.07, n)
         bf_sims = np.clip(bf_sims, 12, 36)
-        conc_map = {"A+": 180, "A": 120, "B+": 80, "B": 60, "C": 30, "D": 15}
-        conc = conc_map.get(p.grade, 60)
+        conc = {"A+":180,"A":120,"B+":80,"B":60,"C":30,"D":15}.get(p.grade,60)
         alpha = max(adj * conc, 1.0)
         beta_p = max((1 - adj) * conc, 1.0)
         k_sims = []
         for bf in bf_sims:
-            size = int(round(float(bf)))
-            ps = np.random.beta(alpha, beta_p, size=size)
+            ps = np.random.beta(alpha, beta_p, size=int(round(float(bf))))
             k_sims.append(np.random.binomial(1, ps).sum())
         k_sims = np.array(k_sims)
-        mean_k = float(k_sims.mean())
-        exact = round(mean_k + float(np.random.normal(0, 0.05)), 3)
-        dist = {}
-        for i in range(16):
-            dist[i] = float((k_sims == i).mean())
-        return {"mean": mean_k, "exact": exact, "exp_ip": float(ip_sims.mean()), "sims": k_sims, "dist": dist, "adj_k": adj}
-
+        return {"mean": float(k_sims.mean()), "exact": round(float(k_sims.mean()+np.random.normal(0,0.05)),3), "exp_ip": float(ip_sims.mean()), "sims": k_sims, "adj_k": adj}
     @staticmethod
-    def p_over(sims, line):
-        return float((sims > line).mean())
-
+    def p_over(sims, line): return float((sims > line).mean())
     @staticmethod
     def amer(p):
         if p <= 0.01: return 9900
         if p >= 0.99: return -9900
-        if p >= 0.5: return int(-(p * 100) / (1 - p))
-        else: return int((1 - p) * 100 / p)
+        return int(-(p*100)/(1-p)) if p >= 0.5 else int((1-p)*100/p)
 
-SLATE = [
+BASE_SLATE = [
     Pitcher("Ian Seymour", "TB", "NYM", "L", 6.5, [9,7,9,8,5], 0.28, 0.13, 0.26, 93.5, 0.23, 5.2, "B", 0.7, 1.1),
     Pitcher("Payton Tolle", "SEA", "BOS", "L", 6.5, [7,14,4,6,7], 0.29, 0.14, 0.27, 94.8, 0.24, 5.3, "B+", 1.2, 0.7),
     Pitcher("Jacob deGrom", "TEX", "ATH", "R", 6.5, [3,9,3,10,2], 0.33, 0.15, 0.31, 97.2, 0.28, 6.0, "A+", 1.0, 1.0),
@@ -126,49 +96,87 @@ SLATE = [
 TEAM_K = {"NYM":0.225,"TB":0.25,"SEA":0.255,"BOS":0.23,"ATH":0.26,"TEX":0.24,"SD":0.21,"CIN":0.24,"MIL":0.24,"CHC":0.25,"DET":0.26,"MIN":0.27,"CWS":0.28,"HOU":0.215,"NYY":0.23,"LAA":0.26,"MIA":0.26,"WSH":0.235,"BAL":0.23,"COL":0.26,"PHI":0.22,"AZ":0.22}
 PARK_K = {"COL":0.88,"CIN":0.98,"BOS":0.99,"TEX":1.02,"CHC":1.01,"MIN":1.03,"HOU":0.97,"LAA":0.99,"WSH":1.01,"AZ":1.04,"TB":1.03}
 
-def run_model():
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_live_fangraphs(year=2025):
+    try:
+        df = pitching_stats(year, year, qual=1)
+        return df
+    except:
+        return pd.DataFrame()
+
+def apply_live_stats(base_slate, live_df):
+    if live_df.empty: return base_slate, []
+    live_df["Name_lower"] = live_df["Name"].str.lower()
+    updated, logs = [], []
+    for p in base_slate:
+        match = live_df[live_df["Name_lower"].str.contains(p.name.split()[-1].lower(), na=False)]
+        if not match.empty:
+            row = match.iloc[0]
+            try:
+                k_raw = row.get("K%", p.k_pct)
+                k_pct = float(str(k_raw).replace("%","").strip())/100 if isinstance(k_raw,str) else float(k_raw)/100 if float(k_raw)>1 else float(k_raw)
+                sw_raw = row.get("SwStr%", p.swstr)
+                sw = float(str(sw_raw).replace("%","").strip())/100 if isinstance(sw_raw,str) else float(sw_raw)/100 if float(sw_raw)>1 else float(sw_raw)
+                fbv = row.get("FBv", row.get("vFA (pi)", p.velo))
+                fbv = float(fbv)
+                new_p = Pitcher(p.name,p.team,p.opp,p.throws,p.line,p.l5,float(np.clip(k_pct,0.12,0.40)),float(np.clip(sw,0.07,0.18)),p.putaway,float(fbv),p.arsenal_k,p.avg_ip,p.grade,p.less_x,p.more_x)
+                updated.append(new_p)
+                logs.append(f"✓ {p.name}: Live K% {k_pct*100:.1f}% SwStr {sw*100:.1f}% Velo {fbv:.1f}")
+            except Exception as ex:
+                updated.append(p); logs.append(f"! {p.name}: {ex}")
+        else:
+            updated.append(p); logs.append(f"- {p.name}: No match - estimate")
+    return updated, logs
+
+st.title("MLB Pitcher K Model - Live Statcast Version")
+
+col1, col2 = st.columns([2,1])
+with col1:
+    use_live = st.checkbox("Use Live Statcast (auto-update K%, SwStr%, velo)", value=False)
+with col2:
+    year = st.selectbox("Season", [2025, 2024, 2026], index=0)
+
+if use_live:
+    if not HAS_PYBASEBALL:
+        st.error("pybaseball not installed - add to requirements.txt")
+        slate = BASE_SLATE
+    else:
+        with st.spinner(f"Pulling live Fangraphs {year}... 30s first time"):
+            live_df = fetch_live_fangraphs(year)
+            slate, logs = apply_live_stats(BASE_SLATE, live_df)
+            st.success(f"Live data: {len(live_df)} pitchers")
+            with st.expander("Live update log"):
+                for l in logs: st.write(l)
+else:
+    slate = BASE_SLATE
+
+def run_model(slate_list):
     model = KModel()
     rows = []
-    for p in SLATE:
+    for p in slate_list:
         opp_k = TEAM_K.get(p.opp, 0.23)
         park_k = PARK_K.get(p.opp, 1.0)
         ctx = GameContext(p.opp, park_k)
         proj = model.project(p, opp_k, ctx, n=6000)
         pover = model.p_over(proj["sims"], p.line)
         punder = 1 - pover
-        fair_over = model.amer(pover)
-        fair_under = model.amer(punder)
-        ev_more = pover * p.more_x - punder * 1
-        ev_less = punder * p.less_x - pover * 1
+        ev_more = pover * p.more_x - punder
+        ev_less = punder * p.less_x - pover
         lean = "PASS"
-        if ev_more > 0.08 and pover > 0.55:
-            lean = f"MORE {p.line}"
-        elif ev_less > 0.08 and punder > 0.55:
-            lean = f"LESS {p.line}"
-        elif ev_more > 0.03:
-            lean = f"Lean MORE {p.line}"
-        elif ev_less > 0.03:
-            lean = f"Lean LESS {p.line}"
-        l5_str = "+".join(map(str, p.l5))
-        l5_avg = float(np.mean(p.l5))
+        if ev_more > 0.08 and pover > 0.55: lean = f"MORE {p.line}"
+        elif ev_less > 0.08 and punder > 0.55: lean = f"LESS {p.line}"
+        elif ev_more > 0.03: lean = f"Lean MORE {p.line}"
+        elif ev_less > 0.03: lean = f"Lean LESS {p.line}"
         rows.append({
             "Pitcher": p.name, "Matchup": f"{p.team}@{p.opp}", "Line": p.line,
-            "L5": f"{l5_str} ({l5_avg:.1f})", "Model": round(proj["mean"], 2),
-            "Exact": proj["exact"], "Exp IP": round(proj["exp_ip"], 1),
-            "P OVER": f"{pover*100:.1f}%", "Fair OVER": fair_over,
-            "Dabble More": f"{p.more_x}x", "Dabble Less": f"{p.less_x}x",
-            "EV More": round(ev_more, 3), "EV Less": round(ev_less, 3), "Lean": lean
+            "Live K%": f"{p.k_pct*100:.1f}%", "Live SwStr%": f"{p.swstr*100:.1f}%", "Velo": f"{p.velo:.1f}",
+            "Model": round(proj["mean"],2), "Exp IP": round(proj["exp_ip"],1),
+            "P OVER": f"{pover*100:.1f}%", "Fair OVER": model.amer(pover),
+            "EV More": round(ev_more,3), "EV Less": round(ev_less,3), "Lean": lean
         })
-    df = pd.DataFrame(rows)
-    df = df.sort_values("EV More", ascending=False)
-    return df
-
-st.title("MLB Pitcher K Model - ATS WINS Logic (Fixed)")
-st.caption("No scipy - runs on Streamlit Cloud. Full 19 pitcher Dabble slate.")
+    return pd.DataFrame(rows).sort_values("EV More", ascending=False)
 
 if st.button("Run Full Slate (19 pitchers)"):
-    with st.spinner("Simulating 6k sims per pitcher..."):
-        df = run_model()
+    with st.spinner("Simulating..."):
+        df = run_model(slate)
         st.dataframe(df, use_container_width=True)
-else:
-    st.info("Click Run to generate projections.")
