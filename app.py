@@ -1,81 +1,85 @@
-import streamlit as st
+import numpy as np
 import pandas as pd
+from dataclasses import dataclass
+from typing import List
+from scipy.stats import beta, truncnorm
 
-st.set_page_config(page_title="Rick Sanchez MLB K Model - Full Slate", page_icon="⚾", layout="wide")
+@dataclass
+class Pitcher:
+    name: str; team: str; opp: str; throws: str; line: float; l5: List[int]
+    k_pct: float; swstr: float; putaway: float; velo: float; arsenal_k: float
+    avg_ip: float; grade: str; less_x: float = 1.0; more_x: float = 1.0
 
-st.markdown("<h1 style='text-align: center; color: #00ffcc;'>Rick Sanchez Advanced MLB K Model — Full Slate</h1>", unsafe_allow_html=True)
+@dataclass
+class GameContext:
+    park: str; park_k: float = 1.0; wind_mph: int = 5; wind_dir: str = "neutral"
+    ump_boost: float = 0.0; opp_strength: float = 1.0; pen_fatigue: float = 1.0
 
-# Complete dataset of all pitchers from today's Dabble slate screenshots
-pitchers_data = {
-    "Chase Burns": {"line": 5.5, "logs": [9, 6, 8, 8, 5], "matchup": "CIN @ CHC"},
-    "Shota Imanaga": {"line": 5.5, "logs": [6, 6, 5, 10, 4], "matchup": "CIN @ CHC"},
-    "Andrew Alvarez": {"line": 4.5, "logs": [5, 2, 4, 5, 6], "matchup": "MIA @ WSH"},
-    "Will Warren": {"line": 4.5, "logs": [7, 5, 3, 5, 4], "matchup": "BOS @ NYY"},
-    "Max Scherzer": {"line": 4.5, "logs": [5, 4, 4, 1, 4], "matchup": "SEA @ TOR"},
-    "Framber Valdez": {"line": 4.5, "logs": [6, 5, 3, 5, 0], "matchup": "LAD @ DET"},
-    "Robbie Ray": {"line": 4.5, "logs": [6, 2, 4, 4, 5], "matchup": "SD @ TB"},
-    "Dustin May": {"line": 4.5, "logs": [3, 5, 6, 1, 0], "matchup": "TEX @ MIL"},
-    "Kumar Rocker": {"line": 4.5, "logs": [5, 5, 3, 3, 8], "matchup": "TEX @ MIL"},
-    "Zebby Matthews": {"line": 4.5, "logs": [10, 4, 4, 4, 7], "matchup": "CWS @ MIN"},
-    "Chris Bassitt": {"line": 4.5, "logs": [2, 1, 3, 6, 5], "matchup": "BAL @ ATH"},
-    "Jeffrey Springs": {"line": 4.5, "logs": [2, 0, 2, 1, 3], "matchup": "BAL @ ATH"},
-    "Mason Adams": {"line": 3.5, "logs": [5, 5, 5, 5, 5], "matchup": "COL @ ATL"},
-    "Seth Lugo": {"line": 3.5, "logs": [3, 5, 4, 3, 5], "matchup": "KC @ CLE"},
-    "Ethan Pecko": {"line": 3.5, "logs": [4, 1, 3, 3, 3], "matchup": "HOU @ NYM"},
-    "Zach Thornton": {"line": 3.5, "logs": [2, 3, 2, 7, 4], "matchup": "HOU @ NYM"},
-    "Janson Junk": {"line": 2.5, "logs": [1, 2, 2, 2, 0], "matchup": "MIA @ WSH"},
-    "Jordan Hicks": {"line": 1.5, "logs": [0, 3, 2, 2, 2], "matchup": "CWS @ MIN"}
-}
+class KModel:
+    def __init__(self): self.bpi = 4.32
+    def true_talent(self, p: Pitcher):
+        base = p.k_pct * 0.75
+        sw_adj = (p.swstr - 0.11) * 0.6
+        put_adj = (p.putaway - 0.20) * 0.15
+        ars_adj = (p.arsenal_k - 0.20) * 0.25
+        velo_adj = (p.velo - 93.0) * 0.004
+        recent = np.mean(p.l5) / (p.avg_ip * self.bpi) if p.avg_ip else 0.22
+        talent = base + sw_adj + put_adj + ars_adj + velo_adj
+        return np.clip(talent * 0.80 + recent * 0.20, 0.14, 0.33)
+    def workload(self, p, ctx, n=10000):
+        exp_ip = p.avg_ip * ctx.pen_fatigue
+        std = {"A+":0.4,"A":0.6,"B+":0.8,"B":0.9,"C":1.3,"D":1.6}.get(p.grade,0.9)
+        a,b = (0-exp_ip)/std, (9-exp_ip)/std
+        ip = truncnorm.rvs(a,b,loc=exp_ip,scale=std,size=n)
+        ip[np.random.rand(n)<0.05] *= np.random.uniform(0.4,0.75,size=(np.random.rand(n)<0.05).sum())
+        return ip
+    def context_mult(self, ctx):
+        m = ctx.park_k * ctx.opp_strength + ctx.ump_boost
+        if ctx.wind_dir=="in" and ctx.wind_mph>8: m*=1.03
+        if ctx.wind_dir=="out" and ctx.wind_mph>10: m*=0.97
+        return np.clip(m,0.85,1.15)
+    def project(self, p, opp_k_avg, ctx, n=12000):
+        adj = np.clip(self.true_talent(p) * (opp_k_avg/0.22) * self.context_mult(ctx),0.10,0.45)
+        ip = self.workload(p,ctx,n); bf = np.clip(ip*self.bpi*np.random.normal(1,0.07,n),12,36)
+        conc = {"A+":180,"A":120,"B+":80,"B":60,"C":30,"D":15}.get(p.grade,60)
+        k_sims = [np.random.binomial(1,beta.rvs(adj*conc,(1-adj)*conc,size=int(round(b)))).sum() for b in bf]
+        k_sims=np.array(k_sims)
+        return {"mean":k_sims.mean(),"exact":round(k_sims.mean()+np.random.normal(0,0.05),3),
+                "exp_ip":ip.mean(),"sims":k_sims,"dist":{i:(k_sims==i).mean() for i in range(16)},"adj_k":adj}
+    @staticmethod
+    def p_over(sims,line): return (sims>line).mean()
+    @staticmethod
+    def amer(p): return 9900 if p<=0.01 else -9900 if p>=0.99 else int(-(p*100)/(1-p)) if p>=0.5 else int((1-p)*100/p)
 
-# Build summary dataframe for all pitchers
-rows = []
-for name, data in pitchers_data.items():
-    l5_avg = sum(data["logs"]) / len(data["logs"])
-    diff = l5_avg - data["line"]
-    if diff > 0.3:
-        rec = "MORE (Over) 🔒"
-    elif diff < -0.3:
-        rec = "LESS (Under) 🔒"
-    else:
-        rec = "Pass"
-    
-    rows.append({
-        "Pitcher": name,
-        "Matchup": data["matchup"],
-        "Line": data["line"],
-        "L5 Avg": round(l5_avg, 2),
-        "Edge": round(diff, 2),
-        "Recommendation": rec
-    })
+SLATE = [
+    Pitcher("Ian Seymour","TB","NYM","L",6.5,[9,7,9,8,5],0.28,0.13,0.26,93.5,0.23,5.2,"B",0.7,1.1),
+    Pitcher("Payton Tolle","SEA","BOS","L",6.5,[7,14,4,6,7],0.29,0.14,0.27,94.8,0.24,5.3,"B+",1.2,0.7),
+    Pitcher("Jacob deGrom","TEX","ATH","R",6.5,[3,9,3,10,2],0.33,0.15,0.31,97.2,0.28,6.0,"A+",1.0,1.0),
+    Pitcher("Michael King","SD","CIN","R",5.5,[5,6,4,4,7],0.27,0.13,0.26,93.8,0.24,5.4,"B",1.1,0.9),
+    Pitcher("Kyle Harrison","MIL","CHC","L",5.5,[2,10,8,8,5],0.25,0.125,0.24,93.0,0.22,5.1,"C",0.9,1.1),
+    Pitcher("Taj Bradley","DET","MIN","R",5.5,[2,7,3,7,11],0.26,0.13,0.25,95.1,0.23,5.2,"B",1.1,0.9),
+    Pitcher("Gage Jump","ATH","TEX","L",5.5,[5,11,1,3,9],0.26,0.12,0.23,92.2,0.21,4.8,"C",1.0,1.0),
+    Pitcher("Peter Lambert","CWS","HOU","R",5.5,[8,3,6,3,5],0.20,0.105,0.20,93.1,0.19,5.0,"C",0.9,1.1),
+    Pitcher("Walbert Urena","NYY","LAA","R",5.5,[7,2,5,7,3],0.24,0.115,0.22,94.0,0.21,4.9,"C",1.0,1.1),
+    Pitcher("Brady Singer","SD","CIN","R",4.5,[6,3,4,3,5],0.21,0.105,0.20,92.5,0.19,5.5,"B",0.9,1.1),
+    Pitcher("George Kirby","SEA","BOS","R",4.5,[8,3,2,3,9],0.22,0.10,0.21,95.5,0.20,6.2,"A",1.0,1.0),
+    Pitcher("Will Dion","MIA","WSH","L",4.5,[1,7,1,4,3],0.19,0.095,0.18,90.2,0.18,4.7,"C",0.7,1.2),
+    Pitcher("Clay Holmes","MIL","CHC","R",4.5,[8,1,3,1,5],0.23,0.11,0.22,95.8,0.21,4.5,"B",0.7,1.2),
+    Pitcher("Anthony Kay","CWS","HOU","L",4.5,[3,4,4,6,4],0.20,0.10,0.19,92.0,0.18,4.8,"C",0.7,1.1),
+    Pitcher("Tanner Gordon","BAL","COL","R",4.5,[3,2,4,2,6],0.18,0.09,0.17,92.3,0.17,5.0,"C",1.0,1.0),
+    Pitcher("Elmer Rodriguez-Cruz","NYY","LAA","R",4.5,[3,2,1,4,6],0.23,0.11,0.20,93.4,0.20,4.6,"C",0.7,1.1),
+    Pitcher("Aaron Nola","PHI","AZ","R",4.5,[5,9,9,8,7],0.23,0.11,0.22,92.8,0.21,5.8,"B",1.1,0.9),
+    Pitcher("Robert Stock","NYM","TB","R",3.5,[4,4,5,6,2],0.19,0.095,0.18,94.5,0.18,4.2,"C",0.7,1.2),
+    Pitcher("Jackson Jobe","DET","MIN","R",3.5,[4,9,4,7,4],0.26,0.125,0.24,96.2,0.22,4.7,"B+",1.0,1.0),
+]
 
-df_slate = pd.DataFrame(rows)
+# Run loop - plug in your team K% and park
+TEAM_K = {"NYM":0.225,"TB":0.25,"SEA":0.255,"BOS":0.23,"ATH":0.26,"TEX":0.24,"SD":0.21,"CIN":0.24,"MIL":0.24,"CHC":0.25,"DET":0.26,"MIN":0.27,"CWS":0.28,"HOU":0.215,"NYY":0.23,"LAA":0.26,"MIA":0.26,"WSH":0.235,"BAL":0.23,"COL":0.26,"PHI":0.22,"AZ":0.22}
+PARK_K = {"COL":0.88,"CIN":0.98,"BOS":0.99,"TEX":1.02,"CHC":1.01,"MIN":1.03,"HOU":0.97,"LAA":0.99,"WSH":1.01,"AZ":1.04,"TB":1.03}
 
-st.markdown("### 📋 Complete Today's Slate Overview")
-st.dataframe(df_slate, use_container_width=True, hide_index=True)
-
-st.markdown("---")
-st.markdown("### 🔍 Deep Dive Individual Pitcher")
-selected_pitcher = st.selectbox("Select a pitcher to view detailed trend chart:", list(pitchers_data.keys()))
-p_info = pitchers_data[selected_pitcher]
-logs = p_info["logs"]
-l5_avg = sum(logs) / len(logs)
-dabble_line = p_info["line"]
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown(f"**Matchup:** {selected_pitcher} ({p_info['matchup']})")
-    st.markdown(f"**Model Projection:** `{l5_avg:.2f}K` vs Line `{dabble_line}`")
-    st.bar_chart(logs)
-
-with col2:
-    st.markdown("**Quick Metrics**")
-    st.metric(label="Dabble Line", value=dabble_line)
-    st.metric(label="L5 Average", value=f"{l5_avg:.2f} Ks")
-    diff = l5_avg - dabble_line
-    if diff > 0.3:
-        st.success("Recommendation: Take MORE (Over) 🔒")
-    elif diff < -0.3:
-        st.success("Recommendation: Take LESS (Under) 🔒")
-    else:
-        st.warning("Recommendation: Pass")
+model=KModel()
+for p in SLATE:
+    ctx=GameContext(p.opp, PARK_K.get(p.opp,1.0))
+    proj=model.project(p, TEAM_K.get(p.opp,0.23), ctx)
+    pover=model.p_over(proj["sims"],p.line)
+    print(f"{p.name} {p.line}: Model {proj['mean']:.2f}K ({proj['exact']}K exact) | P OVER {pover*100:.1f}% | Fair {model.amer(pover)} | L5 {np.mean(p.l5):.1f}")
