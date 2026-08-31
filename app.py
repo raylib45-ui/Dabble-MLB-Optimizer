@@ -28,7 +28,10 @@ class SimulationResult:
     expected_value: float
     probability_distribution: Dict[str, float]
     prob_over_line: float
-    implied_fair_odds: str
+    prob_under_line: float
+    implied_over_odds: str
+    implied_under_odds: str
+    recommendation: str
 
 
 # ==========================================
@@ -72,13 +75,27 @@ class ATSWinsStrikeoutEngine:
         
         line_threshold = int(np.floor(market_line)) + 1
         prob_over = np.sum(strikeout_samples >= line_threshold) / n_total
-        fair_odds = self._probability_to_american_odds(prob_over)
+        prob_under = 1.0 - prob_over
+        
+        fair_over_odds = self._probability_to_american_odds(prob_over)
+        fair_under_odds = self._probability_to_american_odds(prob_under)
+        
+        # Automatic Pick / Pass Logic (Strict Threshold Rule for Locks: >56% probability required)
+        if prob_over >= 0.56:
+            rec = "🔒 MORE (Over)"
+        elif prob_under >= 0.56:
+            rec = "🔒 LESS (Under)"
+        else:
+            rec = "⚠️ PASS"
         
         return SimulationResult(
             expected_value=round(ev, 2),
             probability_distribution=distribution,
             prob_over_line=round(prob_over * 100, 1),
-            implied_fair_odds=fair_odds
+            prob_under_line=round(prob_under * 100, 1),
+            implied_over_odds=fair_over_odds,
+            implied_under_odds=fair_under_odds,
+            recommendation=rec
         )
 
     @staticmethod
@@ -100,12 +117,10 @@ class ATSWinsStrikeoutEngine:
 st.set_page_config(page_title="ATSwins MLB Strikeout Model", layout="wide")
 
 st.title("🎯 ATSwins MLB Strikeout Projection Dashboard")
-st.markdown("Simulating pitcher outcome distributions and evaluating prop lines from the Dabble slate.")
+st.markdown("Simulating pitcher outcome distributions and automatically evaluating More, Less, or Pass signals.")
 
-# Initialize Engine
 engine = ATSWinsStrikeoutEngine()
 
-# Slate Data from Dabble Lobby
 slate_data = [
     {"name": "Ian Seymour (P)", "line": 6.5, "k_pct": 0.28, "sw_str": 0.14, "called": 0.18, "ip": 6.0, "opp_k": 0.24},
     {"name": "Payton Tolle (P)", "line": 6.5, "k_pct": 0.27, "sw_str": 0.13, "called": 0.17, "ip": 5.8, "opp_k": 0.22},
@@ -128,11 +143,9 @@ slate_data = [
     {"name": "Jackson Jobe (P)", "line": 3.5, "k_pct": 0.23, "sw_str": 0.11, "called": 0.15, "ip": 4.5, "opp_k": 0.21}
 ]
 
-# Sidebar Controls for Customization
 st.sidebar.header("⚙️ Model Settings")
 selected_pitcher_name = st.sidebar.selectbox("Select Pitcher to Inspect", [p["name"] for p in slate_data])
 
-# Find selected pitcher data
 selected_data = next(p for p in slate_data if p["name"] == selected_pitcher_name)
 
 st.sidebar.subheader("Adjust Parameters")
@@ -141,7 +154,6 @@ custom_ip = st.sidebar.number_input("Projected Innings", value=float(selected_da
 missing_power = st.sidebar.checkbox("Opponent Missing Power Hitter?", value=False)
 wind_outward = st.sidebar.checkbox("Wind Blowing Out?", value=False)
 
-# Run simulation for selected pitcher
 pitcher_obj = PitcherProfile(
     name=selected_data["name"],
     base_k_pct=selected_data["k_pct"],
@@ -158,12 +170,12 @@ lineup_obj = LineupContext(
 
 sim_result = engine.evaluate_prop(pitcher_obj, lineup_obj, custom_line)
 
-# Display Key Metrics
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Model Expected Value (EV)", f"{sim_result.expected_value} K's")
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Model EV", f"{sim_result.expected_value} K's")
 col2.metric("Market Line", f"{custom_line}")
-col3.metric("Over Prob (%)", f"{sim_result.prob_over_line}%")
-col4.metric("Fair Odds (Over)", f"{sim_result.implied_fair_odds}")
+col3.metric("Over Prob", f"{sim_result.prob_over_line}%")
+col4.metric("Under Prob", f"{sim_result.prob_under_line}%")
+col5.metric("Model Signal", f"{sim_result.recommendation}")
 
 st.markdown("---")
 st.subheader(f"📊 Outcome Distribution for {selected_pitcher_name}")
@@ -171,7 +183,7 @@ dist_df = pd.DataFrame(list(sim_result.probability_distribution.items()), column
 st.bar_chart(dist_df.set_index("Strikeouts"))
 
 st.markdown("---")
-st.subheader("📋 Full Dabble Slate Evaluation Table")
+st.subheader("📋 Full Dabble Slate Automatic Signals")
 
 results_list = []
 for item in slate_data:
@@ -182,8 +194,9 @@ for item in slate_data:
         "Pitcher": item["name"],
         "Line": item["line"],
         "Model EV": res.expected_value,
-        "Over Prob (%)": res.prob_over_line,
-        "Fair Odds": res.implied_fair_odds
+        "Over %": res.prob_over_line,
+        "Under %": res.prob_under_line,
+        "Signal": res.recommendation
     })
 
 st.dataframe(pd.DataFrame(results_list), use_container_width=True)
