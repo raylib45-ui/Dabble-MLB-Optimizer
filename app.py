@@ -80,7 +80,7 @@ class ATSWinsStrikeoutEngine:
         fair_over_odds = self._probability_to_american_odds(prob_over)
         fair_under_odds = self._probability_to_american_odds(prob_under)
         
-        # Automatic Pick / Pass Logic (Strict Threshold Rule for Locks: >56% probability required)
+        # Strict Threshold Rule (>56% probability required for locks)
         if prob_over >= 0.56:
             rec = "🔒 MORE (Over)"
         elif prob_under >= 0.56:
@@ -117,7 +117,7 @@ class ATSWinsStrikeoutEngine:
 st.set_page_config(page_title="ATSwins MLB Strikeout Model", layout="wide")
 
 st.title("🎯 ATSwins MLB Strikeout Projection Dashboard")
-st.markdown("Simulating pitcher outcome distributions and automatically evaluating More, Less, or Pass signals.")
+st.markdown("Simulating pitcher outcome distributions and automatically evaluating **More / Less / Pass** signals.")
 
 engine = ATSWinsStrikeoutEngine()
 
@@ -143,21 +143,24 @@ slate_data = [
     {"name": "Jackson Jobe (P)", "line": 3.5, "k_pct": 0.23, "sw_str": 0.11, "called": 0.15, "ip": 4.5, "opp_k": 0.21}
 ]
 
-st.sidebar.header("⚙️ Model Settings")
+st.sidebar.header("⚙️ Model Controls")
 selected_pitcher_name = st.sidebar.selectbox("Select Pitcher to Inspect", [p["name"] for p in slate_data])
 
 selected_data = next(p for p in slate_data if p["name"] == selected_pitcher_name)
 
-st.sidebar.subheader("Adjust Parameters")
+st.sidebar.subheader("Adjust Pitcher Metrics")
 custom_line = st.sidebar.number_input("Market Line", value=float(selected_data["line"]), step=0.5)
 custom_ip = st.sidebar.number_input("Projected Innings", value=float(selected_data["ip"]), step=0.1)
+custom_k_pct = st.sidebar.slider("Base K%", min_value=0.10, max_value=0.45, value=float(selected_data["k_pct"]), step=0.01)
+custom_sw_str = st.sidebar.slider("Swinging Strike %", min_value=0.05, max_value=0.25, value=float(selected_data["sw_str"]), step=0.01)
+
 missing_power = st.sidebar.checkbox("Opponent Missing Power Hitter?", value=False)
 wind_outward = st.sidebar.checkbox("Wind Blowing Out?", value=False)
 
 pitcher_obj = PitcherProfile(
     name=selected_data["name"],
-    base_k_pct=selected_data["k_pct"],
-    sw_str_pct=selected_data["sw_str"],
+    base_k_pct=custom_k_pct,
+    sw_str_pct=custom_sw_str,
     called_str_pct=selected_data["called"],
     projected_innings=custom_ip
 )
@@ -183,7 +186,7 @@ dist_df = pd.DataFrame(list(sim_result.probability_distribution.items()), column
 st.bar_chart(dist_df.set_index("Strikeouts"))
 
 st.markdown("---")
-st.subheader("📋 Full Dabble Slate Automatic Signals")
+st.subheader("📋 Full Slate Automatic Signals & Recommendations")
 
 results_list = []
 for item in slate_data:
