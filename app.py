@@ -1,21 +1,11 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
+import requests
 from dataclasses import dataclass
 from typing import List
-import os
-import traceback
 
-os.environ['PYBASEBALL_CACHE'] = '/tmp'
-st.set_page_config(page_title="MLB K Model - Live pybaseball", layout="wide")
-
-try:
-    from pybaseball import pitching_stats
-    HAS_PYBASEBALL = True
-    IMPORT_ERROR = ""
-except Exception as e:
-    HAS_PYBASEBALL = False
-    IMPORT_ERROR = traceback.format_exc()
+st.set_page_config(page_title="MLB K Model - Live", layout="wide")
 
 @dataclass
 class Pitcher:
@@ -50,12 +40,10 @@ class KModel:
         ars_adj = (p.arsenal_k - 0.20) * 0.25
         velo_adj = (p.velo - 93.0) * 0.004
         recent = float(np.mean(p.l5)) / (p.avg_ip * self.bpi)
-        talent = base + sw_adj + put_adj + ars_adj + velo_adj
-        return float(np.clip(talent * 0.80 + recent * 0.20, 0.14, 0.33))
+        return float(np.clip(base+sw_adj+put_adj+ars_adj+velo_adj*0.8+recent*0.2,0.14,0.33))
     def workload(self, p, ctx, n=6000):
-        exp_ip = p.avg_ip
         std = {"A+":0.4,"A":0.6,"B+":0.8,"B":0.9,"C":1.3,"D":1.6}.get(p.grade,0.9)
-        ip = np.clip(np.random.normal(exp_ip,std,size=n),0.5,9.0)
+        ip = np.clip(np.random.normal(p.avg_ip,std,size=n),0.5,9.0)
         ip[np.random.rand(n)<0.05] *= np.random.uniform(0.4,0.75,size=(np.random.rand(n)<0.05).sum())
         return ip
     def project(self, p, opp_k, ctx, n=6000):
@@ -68,11 +56,15 @@ class KModel:
             ps = np.random.beta(max(adj*conc,1),max((1-adj)*conc,1),size=int(round(float(b))))
             k_sims.append(np.random.binomial(1,ps).sum())
         k_sims = np.array(k_sims)
-        return {"mean":float(k_sims.mean()),"exact":round(float(k_sims.mean()+np.random.normal(0,0.05)),3),"exp_ip":float(ip.mean()),"sims":k_sims}
+        return {"mean":float(k_sims.mean()),"sims":k_sims,"exp_ip":float(ip.mean())}
     @staticmethod
-    def p_over(sims,line): return float((sims>line).mean())
+    def p_over(sims,line):
+        return float((sims>line).mean())
     @staticmethod
-    def amer(p): return 9900 if p<=0.01 else -9900 if p>=0.99 else int(-(p*100)/(1-p)) if p>=0.5 else int((1-p)*100/p)
+    def amer(p):
+        if p<=0.01: return 9900
+        if p>=0.99: return -9900
+        return int(-(p*100)/(1-p)) if p>=0.5 else int((1-p)*100/p)
 
 BASE_SLATE = [
     Pitcher("Ian Seymour","TB","NYM","L",6.5,[9,7,9,8,5],0.28,0.13,0.26,93.5,0.23,5.2,"B",0.7,1.1),
@@ -95,47 +87,47 @@ BASE_SLATE = [
     Pitcher("Robert Stock","NYM","TB","R",3.5,[4,4,5,6,2],0.19,0.095,0.18,94.5,0.18,4.2,"C",0.7,1.2),
     Pitcher("Jackson Jobe","DET","MIN","R",3.5,[4,9,4,7,4],0.26,0.125,0.24,96.2,0.22,4.7,"B+",1.0,1.0),
 ]
+
 TEAM_K = {"NYM":0.225,"TB":0.25,"SEA":0.255,"BOS":0.23,"ATH":0.26,"TEX":0.24,"SD":0.21,"CIN":0.24,"MIL":0.24,"CHC":0.25,"DET":0.26,"MIN":0.27,"CWS":0.28,"HOU":0.215,"NYY":0.23,"LAA":0.26,"MIA":0.26,"WSH":0.235,"BAL":0.23,"COL":0.26,"PHI":0.22,"AZ":0.22}
 PARK_K = {"COL":0.88,"CIN":0.98,"BOS":0.99,"TEX":1.02,"CHC":1.01,"MIN":1.03,"HOU":0.97,"LAA":0.99,"WSH":1.01,"AZ":1.04,"TB":1.03}
 
 @st.cache_data(ttl=3600)
-def fetch_live(year):
-    return pitching_stats(year, year, qual=1)
+def fetch_live(year=2025):
+    try:
+        url = f"https://www.fangraphs.com/api/leaders/major-league/data?age=&pos=all&stats=pit&lg=all&qual=0&season={year}&season1={year}&startdate={year}-03-01&enddate={year}-11-01&month=0&hand=&team=0&pageitems=2000000000&pagenum=1"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20)
+        df = pd.DataFrame(r.json().get("data", []))
+        return df
+    except:
+        return pd.DataFrame()
 
-st.title("MLB Pitcher K Model - Live pybaseball")
-if not HAS_PYBASEBALL:
-    st.error("pybaseball not installed - paste requirements.txt and reboot:")
-    st.code("streamlit\nnumpy\npandas\nscipy\npybaseball\nlxml\nhtml5lib\nbeautifulsoup4\nrequests\ntqdm")
-    st.code(IMPORT_ERROR)
-    st.stop()
-st.success("pybaseball installed ✓")
+st.title("MLB Pitcher K Model - Live Statcast")
+st.caption("Live Fangraphs API - No pybaseball needed")
 
 use_live = st.checkbox("Use Live Statcast (auto-update K%, SwStr%, velo)", value=True)
 year = st.selectbox("Season", [2025,2026,2024], index=0)
+
 slate = BASE_SLATE
 if use_live:
-    with st.spinner(f"Pulling Fangraphs {year} via pybaseball... 30-60s"):
-        try:
-            live_df = fetch_live(year)
-            live_df["Name_lower"] = live_df["Name"].str.lower()
-            for i, p in enumerate(slate):
-                last = p.name.split()[-1].lower()
-                m = live_df[live_df["Name_lower"].str.contains(last, na=False)]
-                if not m.empty:
-                    row = m.iloc[0]
-                    try:
-                        k = row.get("K%")
-                        k = float(str(k).replace("%","").strip())/100 if "%" in str(k) else float(k)/100 if float(k)>1 else float(k)
-                        sw = row.get("SwStr%")
-                        sw = float(str(sw).replace("%","").strip())/100 if "%" in str(sw) else float(sw)/100 if float(sw)>1 else float(sw)
-                        fbv = float(row.get("FBv", p.velo))
-                        slate[i].k_pct = float(np.clip(k,0.12,0.40))
-                        slate[i].swstr = float(np.clip(sw,0.07,0.18))
-                        slate[i].velo = float(fbv)
-                    except: pass
-            st.success(f"Live data merged")
-        except Exception as e:
-            st.error(f"Live pull failed: {e}")
+    with st.spinner(f"Pulling live Fangraphs {year}..."):
+        live_df = fetch_live(year)
+        if not live_df.empty:
+            st.success(f"Live pulled {len(live_df)} pitchers")
+            name_col = "PlayerName" if "PlayerName" in live_df.columns else "Name"
+            if name_col in live_df.columns:
+                live_df["Name_lower"] = live_df[name_col].astype(str).str.lower()
+                for i, p in enumerate(slate):
+                    m = live_df[live_df["Name_lower"].str.contains(p.name.split()[-1].lower(), na=False)]
+                    if not m.empty:
+                        row = m.iloc[0]
+                        try:
+                            k = row.get("K%")
+                            if isinstance(k, str): k = float(k.replace("%",""))/100
+                            else: k = float(k)/100 if float(k)>1 else float(k)
+                            slate[i].k_pct = float(np.clip(k,0.12,0.40))
+                        except: pass
+        else:
+            st.warning("Live fetch blocked, using estimates")
 
 if st.button("Run Full Slate (19 pitchers)"):
     model = KModel()
@@ -144,5 +136,15 @@ if st.button("Run Full Slate (19 pitchers)"):
         ctx = GameContext(p.opp, PARK_K.get(p.opp,1.0))
         proj = model.project(p, TEAM_K.get(p.opp,0.23), ctx)
         pover = model.p_over(proj["sims"], p.line)
-        rows.append({"Pitcher":p.name,"Line":p.line,"Live K%":f"{p.k_pct*100:.1f}%","Model":round(proj["mean"],2),"P OVER":f"{pover*100:.1f}%","Lean":f"{'MORE' if pover>0.55 else 'LESS' if pover<0.45 else 'PASS'} {p.line}"})
-    st.dataframe(pd.DataFrame(rows).sort_values("Model", ascending=False), use_container_width=True)
+        rows.append({
+            "Pitcher": p.name,
+            "Line": p.line,
+            "Live K%": f"{p.k_pct*100:.1f}%",
+            "Model": round(proj["mean"],2),
+            "Exp IP": round(proj["exp_ip"],1),
+            "P OVER": f"{pover*100:.1f}%",
+            "Fair OVER": model.amer(pover),
+            "Lean": f"{'MORE' if pover>0.55 else 'LESS' if pover<0.45 else 'PASS'} {p.line}"
+        })
+    df = pd.DataFrame(rows).sort_values("Model", ascending=False)
+    st.dataframe(df, use_container_width=True)
