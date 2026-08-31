@@ -1,148 +1,177 @@
-import streamlit as st
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import List
-import os
-import traceback
+from typing import List, Dict
+from scipy.stats import beta, truncnorm
 
-os.environ['PYBASEBALL_CACHE'] = '/tmp'
-st.set_page_config(page_title="MLB K Model - Live pybaseball", layout="wide")
-
-try:
-    from pybaseball import pitching_stats
-    HAS_PYBASEBALL = True
-    IMPORT_ERROR = ""
-except Exception as e:
-    HAS_PYBASEBALL = False
-    IMPORT_ERROR = traceback.format_exc()
+@dataclass
+class Hitter:
+    name: str
+    bats: str
+    k_pct_vs_rhp: float
+    k_pct_vs_lhp: float
+    high_k_flag: bool = False
+    def k_vs(self, pitcher_throws: str) -> float:
+        return self.k_pct_vs_rhp if pitcher_throws == "R" else self.k_pct_vs_lhp
 
 @dataclass
 class Pitcher:
     name: str
-    team: str
-    opp: str
     throws: str
-    line: float
-    l5: List[int]
     k_pct: float
-    swstr: float
-    putaway: float
-    velo: float
-    arsenal_k: float
-    avg_ip: float
-    grade: str
-    less_x: float = 1.0
-    more_x: float = 1.0
+    swinging_strike_pct: float
+    called_strike_plus_whiff: float
+    putaway_pct: float
+    velo_mph: float
+    arsenal_k_vs_rhb: float
+    arsenal_whiff_vs_rhb: float
+    arsenal_k_vs_lhb: float = 0.20
+    arsenal_whiff_vs_lhb: float = 0.26
+    avg_ip: float = 5.8
+    avg_pitch_count: float = 92
+    ip_std: float = 0.9
+    pitches_per_pa: float = 4.1
+    consistency_grade: str = "B" # A+ = narrow, C = wide
+    last10_k_avg: float = 6.0
+    l10_line_avg: float = 6.0
 
 @dataclass
 class GameContext:
-    park: str
-    park_k: float = 1.0
+    park_factor_k: float = 1.0
+    wind_mph: float = 0
+    wind_direction: str = "neutral"
+    ump_k_boost: float = 0.0
+    offense_strength: float = 1.0
+    game_importance: float = 1.0
+    bullpen_fatigue: float = 1.0
 
-class KModel:
-    def __init__(self):
-        self.bpi = 4.32
-    def true_talent(self, p):
-        base = p.k_pct * 0.75
-        sw_adj = (p.swstr - 0.11) * 0.6
-        put_adj = (p.putaway - 0.20) * 0.15
-        ars_adj = (p.arsenal_k - 0.20) * 0.25
-        velo_adj = (p.velo - 93.0) * 0.004
-        recent = float(np.mean(p.l5)) / (p.avg_ip * self.bpi)
-        talent = base + sw_adj + put_adj + ars_adj + velo_adj
-        return float(np.clip(talent * 0.80 + recent * 0.20, 0.14, 0.33))
-    def workload(self, p, ctx, n=6000):
-        exp_ip = p.avg_ip
-        std = {"A+":0.4,"A":0.6,"B+":0.8,"B":0.9,"C":1.3,"D":1.6}.get(p.grade,0.9)
-        ip = np.clip(np.random.normal(exp_ip,std,size=n),0.5,9.0)
-        ip[np.random.rand(n)<0.05] *= np.random.uniform(0.4,0.75,size=(np.random.rand(n)<0.05).sum())
-        return ip
-    def project(self, p, opp_k, ctx, n=6000):
-        adj = float(np.clip(self.true_talent(p)*(opp_k/0.22)*ctx.park_k,0.10,0.38))
-        ip = self.workload(p,ctx,n)
-        bf = np.clip(ip*4.32*np.random.normal(1,0.07,n),12,36)
-        conc = {"A+":180,"A":120,"B+":80,"B":60,"C":30,"D":15}.get(p.grade,60)
+class MLBPitcherKModel:
+    def __init__(self, batters_per_inning: float = 4.32):
+        self.bpi = batters_per_inning
+
+    def pitcher_true_talent(self, p: Pitcher, vs: str) -> float:
+        base = p.k_pct * 0.50
+        sw = p.swinging_strike_pct * 2.0 * 0.20
+        putaway = p.putaway_pct * 0.30
+        arsenal = (p.arsenal_k_vs_rhb if vs == "RHB" else p.arsenal_k_vs_lhb) * 0.20
+        velo_adj = (p.velo_mph - 93.0) * 0.008
+        talent = base + sw + putaway + arsenal + velo_adj
+        blended = talent * 0.7 + (p.last10_k_avg / (p.avg_ip * self.bpi)) * 0.3
+        return np.clip(blended, 0.12, 0.38)
+
+    def opponent_factor(self, pitcher: Pitcher, lineup: List[Hitter]):
+        k_list = [h.k_vs(pitcher.throws) for h in lineup]
+        avg_k = np.mean(k_list)
+        high_k_count = sum(1 for h in lineup if h.high_k_flag)
+        high_k_adjust = (high_k_count - 3.5) * 0.015
+        breakdown = [{"batter": h.name, "k%": h.k_vs(pitcher.throws)} for h in lineup]
+        return avg_k + high_k_adjust, high_k_count, breakdown
+
+    def expected_workload(self, p: Pitcher, ctx: GameContext, n_sims: int = 10000):
+        exp_ip = p.avg_ip * ctx.bullpen_fatigue * ctx.game_importance
+        grade_to_std = {"A+": 0.4, "A": 0.6, "B+": 0.8, "B": 0.9, "C": 1.3, "D": 1.6}
+        std = grade_to_std.get(p.consistency_grade, p.ip_std)
+        a, b = (0 - exp_ip) / std, (9 - exp_ip) / std
+        ip_dist = truncnorm.rvs(a, b, loc=exp_ip, scale=std, size=n_sims)
+        early_exit_mask = np.random.rand(n_sims) < 0.05
+        ip_dist[early_exit_mask] *= np.random.uniform(0.4, 0.75, size=early_exit_mask.sum())
+        return ip_dist
+
+    def context_multiplier(self, ctx: GameContext) -> float:
+        mult = 1.0 * ctx.park_factor_k * ctx.offense_strength
+        if ctx.wind_direction == "in" and ctx.wind_mph > 8: mult *= 1.03
+        elif ctx.wind_direction == "out" and ctx.wind_mph > 10: mult *= 0.97
+        mult += ctx.ump_k_boost
+        return np.clip(mult, 0.85, 1.15)
+
+    def project(self, pitcher: Pitcher, lineup: List[Hitter], ctx: GameContext, n_sims: int = 10000):
+        true_talent = self.pitcher_true_talent(pitcher, "RHB")
+        opp_k_avg, high_k_count, breakdown = self.opponent_factor(pitcher, lineup)
+        adj_k_per_pa = true_talent * (opp_k_avg / 0.22) * self.context_multiplier(ctx)
+        adj_k_per_pa = np.clip(adj_k_per_pa, 0.10, 0.45)
+
+        ip_sims = self.expected_workload(pitcher, ctx, n_sims=n_sims)
+        bf_sims = ip_sims * self.bpi * np.random.normal(1.0, 0.07, n_sims)
+        bf_sims = np.clip(bf_sims, 12, 36)
+
+        grade_to_conc = {"A+": 180, "A": 120, "B+": 80, "B": 60, "C": 30, "D": 15}
+        conc = grade_to_conc.get(pitcher.consistency_grade, 60)
+        alpha = adj_k_per_pa * conc
+        beta_param = (1 - adj_k_per_pa) * conc
+
         k_sims = []
-        for b in bf:
-            ps = np.random.beta(max(adj*conc,1),max((1-adj)*conc,1),size=int(round(float(b))))
-            k_sims.append(np.random.binomial(1,ps).sum())
+        for bf in bf_sims:
+            bf_int = int(round(bf))
+            p_sample = beta.rvs(alpha, beta_param, size=bf_int)
+            k_sims.append(np.random.binomial(1, p_sample).sum())
         k_sims = np.array(k_sims)
-        return {"mean":float(k_sims.mean()),"exact":round(float(k_sims.mean()+np.random.normal(0,0.05)),3),"exp_ip":float(ip.mean()),"sims":k_sims}
+
+        dist = {i: (k_sims == i).mean() for i in range(0, 16)}
+        return {
+            "pitcher": pitcher.name,
+            "proj_k_mean": round(k_sims.mean(), 2),
+            "exact_model": round(k_sims.mean() + np.random.normal(0, 0.05), 3),
+            "adj_k_per_pa": round(adj_k_per_pa, 4),
+            "opp_k_avg": round(opp_k_avg, 4),
+            "high_k_hitters": high_k_count,
+            "exp_ip_mean": round(ip_sims.mean(), 2),
+            "exp_bf_mean": round(bf_sims.mean(), 1),
+            "k_sims": k_sims,
+            "distribution": dist,
+            "breakdown": breakdown
+        }
+
     @staticmethod
-    def p_over(sims,line): return float((sims>line).mean())
+    def prob_over(k_sims, line): return (k_sims > line).mean()
     @staticmethod
-    def amer(p): return 9900 if p<=0.01 else -9900 if p>=0.99 else int(-(p*100)/(1-p)) if p>=0.5 else int((1-p)*100/p)
+    def american_odds(prob):
+        if prob <= 0.01: return 9900
+        if prob >= 0.99: return -9900
+        return int(-(prob*100)/(1-prob)) if prob>=0.5 else int((1-prob)*100/prob)
 
-BASE_SLATE = [
-    Pitcher("Ian Seymour","TB","NYM","L",6.5,[9,7,9,8,5],0.28,0.13,0.26,93.5,0.23,5.2,"B",0.7,1.1),
-    Pitcher("Payton Tolle","SEA","BOS","L",6.5,[7,14,4,6,7],0.29,0.14,0.27,94.8,0.24,5.3,"B+",1.2,0.7),
-    Pitcher("Jacob deGrom","TEX","ATH","R",6.5,[3,9,3,10,2],0.33,0.15,0.31,97.2,0.28,6.0,"A+",1.0,1.0),
-    Pitcher("Michael King","SD","CIN","R",5.5,[5,6,4,4,7],0.27,0.13,0.26,93.8,0.24,5.4,"B",1.1,0.9),
-    Pitcher("Kyle Harrison","MIL","CHC","L",5.5,[2,10,8,8,5],0.25,0.125,0.24,93.0,0.22,5.1,"C",0.9,1.1),
-    Pitcher("Taj Bradley","DET","MIN","R",5.5,[2,7,3,7,11],0.26,0.13,0.25,95.1,0.23,5.2,"B",1.1,0.9),
-    Pitcher("Gage Jump","ATH","TEX","L",5.5,[5,11,1,3,9],0.26,0.12,0.23,92.2,0.21,4.8,"C",1.0,1.0),
-    Pitcher("Peter Lambert","CWS","HOU","R",5.5,[8,3,6,3,5],0.20,0.105,0.20,93.1,0.19,5.0,"C",0.9,1.1),
-    Pitcher("Walbert Urena","NYY","LAA","R",5.5,[7,2,5,7,3],0.24,0.115,0.22,94.0,0.21,4.9,"C",1.0,1.1),
-    Pitcher("Brady Singer","SD","CIN","R",4.5,[6,3,4,3,5],0.21,0.105,0.20,92.5,0.19,5.5,"B",0.9,1.1),
-    Pitcher("George Kirby","SEA","BOS","R",4.5,[8,3,2,3,9],0.22,0.10,0.21,95.5,0.20,6.2,"A",1.0,1.0),
-    Pitcher("Will Dion","MIA","WSH","L",4.5,[1,7,1,4,3],0.19,0.095,0.18,90.2,0.18,4.7,"C",0.7,1.2),
-    Pitcher("Clay Holmes","MIL","CHC","R",4.5,[8,1,3,1,5],0.23,0.11,0.22,95.8,0.21,4.5,"B",0.7,1.2),
-    Pitcher("Anthony Kay","CWS","HOU","L",4.5,[3,4,4,6,4],0.20,0.10,0.19,92.0,0.18,4.8,"C",0.7,1.1),
-    Pitcher("Tanner Gordon","BAL","COL","R",4.5,[3,2,4,2,6],0.18,0.09,0.17,92.3,0.17,5.0,"C",1.0,1.0),
-    Pitcher("Elmer Rodriguez-Cruz","NYY","LAA","R",4.5,[3,2,1,4,6],0.23,0.11,0.20,93.4,0.20,4.6,"C",0.7,1.1),
-    Pitcher("Aaron Nola","PHI","AZ","R",4.5,[5,9,9,8,7],0.23,0.11,0.22,92.8,0.21,5.8,"B",1.1,0.9),
-    Pitcher("Robert Stock","NYM","TB","R",3.5,[4,4,5,6,2],0.19,0.095,0.18,94.5,0.18,4.2,"C",0.7,1.2),
-    Pitcher("Jackson Jobe","DET","MIN","R",3.5,[4,9,4,7,4],0.26,0.125,0.24,96.2,0.22,4.7,"B+",1.0,1.0),
-]
-TEAM_K = {"NYM":0.225,"TB":0.25,"SEA":0.255,"BOS":0.23,"ATH":0.26,"TEX":0.24,"SD":0.21,"CIN":0.24,"MIL":0.24,"CHC":0.25,"DET":0.26,"MIN":0.27,"CWS":0.28,"HOU":0.215,"NYY":0.23,"LAA":0.26,"MIA":0.26,"WSH":0.235,"BAL":0.23,"COL":0.26,"PHI":0.22,"AZ":0.22}
-PARK_K = {"COL":0.88,"CIN":0.98,"BOS":0.99,"TEX":1.02,"CHC":1.01,"MIN":1.03,"HOU":0.97,"LAA":0.99,"WSH":1.01,"AZ":1.04,"TB":1.03}
+    def evaluate_prop(self, proj_result, market_line, market_over_price=-110, market_under_price=-110):
+        k_sims = proj_result["k_sims"]
+        p_over = self.prob_over(k_sims, market_line)
+        p_under = 1 - p_over
+        fair_over = self.american_odds(p_over)
+        fair_under = self.american_odds(p_under)
 
-@st.cache_data(ttl=3600)
-def fetch_live(year):
-    return pitching_stats(year, year, qual=1)
+        def to_imp(o): return abs(o)/(abs(o)+100) if o<0 else 100/(o+100)
+        m_over, m_under = to_imp(market_over_price), to_imp(market_under_price)
+        total = m_over + m_under
+        edge_over = p_over - (m_over/total)
+        edge_under = p_under - (m_under/total)
 
-st.title("MLB Pitcher K Model - Live pybaseball")
-if not HAS_PYBASEBALL:
-    st.error("pybaseball not installed - paste requirements.txt and reboot:")
-    st.code("streamlit\nnumpy\npandas\nscipy\npybaseball\nlxml\nhtml5lib\nbeautifulsoup4\nrequests\ntqdm")
-    st.code(IMPORT_ERROR)
-    st.stop()
-st.success("pybaseball installed ✓")
+        lean = "NO EDGE"
+        if edge_over > 0.06: lean = f"OVER {market_line} - Strong Signal"
+        elif edge_under > 0.06: lean = f"UNDER {market_line} - Strong Signal"
+        elif edge_over > 0.03: lean = f"Lean OVER {market_line}"
+        elif edge_under > 0.03: lean = f"Lean UNDER {market_line}"
 
-use_live = st.checkbox("Use Live Statcast (auto-update K%, SwStr%, velo)", value=True)
-year = st.selectbox("Season", [2025,2026,2024], index=0)
-slate = BASE_SLATE
-if use_live:
-    with st.spinner(f"Pulling Fangraphs {year} via pybaseball... 30-60s"):
-        try:
-            live_df = fetch_live(year)
-            live_df["Name_lower"] = live_df["Name"].str.lower()
-            for i, p in enumerate(slate):
-                last = p.name.split()[-1].lower()
-                m = live_df[live_df["Name_lower"].str.contains(last, na=False)]
-                if not m.empty:
-                    row = m.iloc[0]
-                    try:
-                        k = row.get("K%")
-                        k = float(str(k).replace("%","").strip())/100 if "%" in str(k) else float(k)/100 if float(k)>1 else float(k)
-                        sw = row.get("SwStr%")
-                        sw = float(str(sw).replace("%","").strip())/100 if "%" in str(sw) else float(sw)/100 if float(sw)>1 else float(sw)
-                        fbv = float(row.get("FBv", p.velo))
-                        slate[i].k_pct = float(np.clip(k,0.12,0.40))
-                        slate[i].swstr = float(np.clip(sw,0.07,0.18))
-                        slate[i].velo = float(fbv)
-                    except: pass
-            st.success(f"Live data merged")
-        except Exception as e:
-            st.error(f"Live pull failed: {e}")
+        return {
+            "line": market_line,
+            "model_mean": proj_result["proj_k_mean"],
+            "p_over": round(p_over,4),
+            "fair_over": fair_over,
+            "edge_over": round(edge_over,4),
+            "edge_under": round(edge_under,4),
+            "lean": lean,
+            "std": round(k_sims.std(),2),
+            "dist": proj_result["distribution"]
+        }
 
-if st.button("Run Full Slate (19 pitchers)"):
-    model = KModel()
-    rows = []
-    for p in slate:
-        ctx = GameContext(p.opp, PARK_K.get(p.opp,1.0))
-        proj = model.project(p, TEAM_K.get(p.opp,0.23), ctx)
-        pover = model.p_over(proj["sims"], p.line)
-        rows.append({"Pitcher":p.name,"Line":p.line,"Live K%":f"{p.k_pct*100:.1f}%","Model":round(proj["mean"],2),"P OVER":f"{pover*100:.1f}%","Lean":f"{'MORE' if pover>0.55 else 'LESS' if pover<0.45 else 'PASS'} {p.line}"})
-    st.dataframe(pd.DataFrame(rows).sort_values("Model", ascending=False), use_container_width=True)
+# Example - matches your last screenshot (5.4 proj vs Twins lineup)
+if __name__ == "__main__":
+    pitcher = Pitcher("Seymour-type", "R", 0.24, 0.115, 0.29, 0.24, 94.2, 0.207, 0.26, consistency_grade="B", avg_ip=5.3, last10_k_avg=5.1)
+    lineup = [
+        Hitter("Bell", "R", 0.21, 0.214, False), Hitter("Lee", "R", 0.144, 0.13, False),
+        Hitter("Keaschall", "R", 0.147, 0.142, False), Hitter("Clemens", "L", 0.226, 0.225, False),
+        Hitter("Lewis", "R", 0.206, 0.265, True), Hitter("Buxton", "R", 0.251, 0.242, True),
+        Hitter("Larnach", "L", 0.17, 0.168, False), Hitter("Caratini", "R", 0.173, 0.156, False),
+        Hitter("Jeffers", "R", 0.169, 0.189, False),
+    ]
+    ctx = GameContext(park_factor_k=1.02, wind_mph=6, wind_direction="in", ump_k_boost=0.01, offense_strength=0.95)
+    model = MLBPitcherKModel()
+    proj = model.project(pitcher, lineup, ctx, 10000)
+    print(proj)
+    print(model.evaluate_prop(proj, 6.5))
