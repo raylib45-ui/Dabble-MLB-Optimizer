@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import List, Dict
-from scipy.stats import beta, truncnorm
 
 @dataclass
 class Hitter:
