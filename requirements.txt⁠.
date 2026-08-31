@@ -1,9 +1,5 @@
 streamlit
 numpy
 pandas
-scipy
-pybaseball
-lxml
-html5lib
-beautifulsoup4
 requests
+lxml
